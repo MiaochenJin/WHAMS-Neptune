@@ -20,7 +20,7 @@ pip install -e .
 
 ```python
 import torch
-from neptune import NeptuneModel
+from whams_neptune import NeptuneModel
 
 model = NeptuneModel(
     in_channels = 6,                   # point features

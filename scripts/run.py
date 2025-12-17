@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from neptune.lightning_model import NeptuneLightningModule
-from neptune.dataloaders.parquet_dataset import ParquetDataModule
+from whams_neptune.lightning_model import NeptuneLightningModule
+from whams_neptune.dataloaders.parquet_dataset import ParquetDataModule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune Training with PyTorch Lightning")

@@ -3,12 +3,13 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "neptune-reco"
+name = "whams_neptune"
 version = "0.1.0"
 description = "A transformer-based point cloud processing model for neutrino event reconstruction"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
+    {name = "Miaochen Jin"},
     {name = "Felix Yu"},
 ]
 classifiers = [
@@ -45,7 +46,7 @@ Issues = "https://github.com/felixyu7/neptune/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["neptune*"]
+include = ["whams_neptune*"]
 
 [tool.black]
 line-length = 100
