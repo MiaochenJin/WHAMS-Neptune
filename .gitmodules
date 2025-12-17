@@ -1,3 +1,0 @@
-[submodule "ml_common"]
-	path = ml_common
-	url = https://github.com/felixyu7/ml-common.git

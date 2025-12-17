@@ -1,0 +1,14 @@
+checkpoints/
+__pycache__/
+neptune/__pycache__/
+neptune/*.pyc
+*.py[cod]
+*.so
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# top level temporary scripts
+temp*.py

@@ -1,304 +1,106 @@
 import argparse
-import importlib.util
-import os
 import sys
-from pathlib import Path
-from typing import Any, Dict, Tuple
-
-import torch
-import torch.nn.functional as F
+import os
 import yaml
+import torch
+from pathlib import Path
+import lightning.pytorch as pl
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
+# Ensure local neptune package is in path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-ML_COMMON_SUBMODULE = ROOT / "ml_common"
-ML_COMMON_PACKAGE = ML_COMMON_SUBMODULE / "ml_common" / "__init__.py"
-if ML_COMMON_PACKAGE.exists():
-    submodule_path = str(ML_COMMON_SUBMODULE)
-    if submodule_path not in sys.path:
-        sys.path.append(submodule_path)
+from neptune.lightning_model import NeptuneLightningModule
+from neptune.dataloaders.parquet_dataset import ParquetDataModule
 
-from ml_common.dataloaders import create_dataloaders
-from ml_common.losses import (
-    CombinedDirectionalLoss,
-    angular_distance_loss,
-    gaussian_nll_loss,
-    von_mises_fisher_loss,
-)
-from ml_common.training import Trainer
-from neptune import NeptuneModel
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Neptune training entrypoint")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Neptune Training with PyTorch Lightning")
     parser.add_argument("-c", "--cfg_file", required=True, help="Path to YAML config")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument("--run-checklist", action="store_true", help="Run data and model checks before training.")
     return parser.parse_args()
 
+def run_checklist(dm):
+    print("--- Running Data Checklist (First 10 batches) ---")
+    print("setup stage")
+    dm.setup(stage="fit")
+    train_loader = dm.train_dataloader()
+    
+    for batch_idx, batch in enumerate(train_loader):
+        if batch_idx >= 10:
+            break
+        
+        # batch structure: coords, features, labels, batch_ids
+        # labels is [N, 5], morphology is at index 4
+        labels = batch[2]
+        
+        if labels.shape[1] > 4:
+            # Move to CPU for bincount if it's on GPU, though dataloader usually yields CPU
+            morph_labels = labels[:, 4].long().cpu()
+            counts = torch.bincount(morph_labels)
+            print(f"Batch {batch_idx:02d} | Total Events: {len(morph_labels)} | Counts (Category 0, 1, ...): {counts.tolist()}")
+        else:
+            print(f"Batch {batch_idx:02d} | Labels tensor size {labels.shape} too small for morphology check.")
 
-def load_config(cfg_path: str) -> Dict[str, Any]:
-    with open(cfg_path, "r") as cfg_file:
-        return yaml.safe_load(cfg_file)
-
-
-def normalize_config(cfg: Dict[str, Any]) -> None:
-    dataloader = cfg.get("dataloader")
-    allowed_dataloaders = {"mmap", "kaggle", "i3"}
-    if dataloader not in allowed_dataloaders:
-        raise ValueError(f"dataloader must be one of {sorted(allowed_dataloaders)}, got {dataloader}")
-
-    training_opts = cfg.get("training_options", {})
-    precision = training_opts.get("precision", "fp32")
-    allowed_precisions = {"bf16", "fp16", "fp32"}
-    if precision not in allowed_precisions:
-        raise ValueError(f"precision must be one of {sorted(allowed_precisions)}, got {precision}")
-    training_opts["precision"] = precision
-
-    schedule = training_opts.pop("lr_schedule", None)
-    if schedule is not None and "T_max" not in training_opts:
-        if isinstance(schedule, (list, tuple)) and len(schedule) > 1:
-            training_opts["T_max"] = schedule[1]
-
-
-def select_device(cfg: Dict[str, Any]) -> torch.device:
-    accelerator = cfg.get("accelerator", "cpu").lower()
-    if accelerator == "gpu" and torch.cuda.is_available():
-        return torch.device("cuda")
-    if accelerator == "mps" and torch.backends.mps.is_available():
-        return torch.device("mps")
-    if accelerator in {"gpu", "mps"}:
-        print(f"{accelerator.upper()} requested but unavailable, falling back to CPU")
-    return torch.device("cpu")
+    print("--- Checklist Complete ---")
 
 
-def setup_wandb(cfg: Dict[str, Any]) -> bool:
-    if importlib.util.find_spec("wandb") is None:
-        print("Weights & Biases not available, falling back to CSV logging")
-        return False
-    import wandb
-
-    wandb.init(project=cfg["project_name"], config=cfg, dir=cfg["project_save_dir"])
-    return True
-
-
-def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Module:
-    task = model_opts["downstream_task"]
-    loss_name = model_opts["loss_fn"]
-
-    if task == "angular_reco":
-        output_dim = 3
-    elif task == "energy_reco":
-        output_dim = 2 if loss_name == "gaussian_nll" else 1
-    elif task == "starting_classification":
-        output_dim = 1
-    elif task == "morphology_classification":
-        output_dim = 6
-    elif task == "track_cascade_classification":
-        output_dim = 1
-    else:
-        raise ValueError(f"Unsupported downstream_task '{task}'")
-
-    k_neighbors = model_opts.get("k_neighbors", 8)
-    tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
-    drop_path_rate = model_opts.get("drop_path_rate", 0.0)
-
-    token_dim = model_opts["token_dim"]
-    num_heads = model_opts["num_heads"]
-    if token_dim % num_heads != 0 or (token_dim // num_heads) % 8 != 0:
-        raise ValueError(
-            f"token_dim ({token_dim}) must be divisible by num_heads ({num_heads}) "
-            "and produce a head_dim divisible by 8 for 4D RoPE."
-        )
-
-    model = NeptuneModel(
-        in_channels=model_opts["in_channels"],
-        num_patches=model_opts["num_patches"],
-        token_dim=token_dim,
-        num_layers=model_opts["num_layers"],
-        num_heads=num_heads,
-        hidden_dim=model_opts["hidden_dim"],
-        dropout=model_opts["dropout"],
-        drop_path_rate=drop_path_rate,
-        output_dim=output_dim,
-        k_neighbors=k_neighbors,
-        tokenizer_kwargs=tokenizer_kwargs,
-    )
-    return model.to(device)
-
-
-def build_loss_function(model_opts: Dict[str, Any]):
-    task = model_opts["downstream_task"]
-    loss_name = model_opts["loss_fn"]
-    loss_kwargs = model_opts.get("loss_kwargs", {})
-
-    if task == "angular_reco":
-        if loss_name == "angular_distance":
-            return lambda preds, labels: angular_distance_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "vmf":
-            return lambda preds, labels: von_mises_fisher_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "combined_vmf_angular":
-            mixed_loss = CombinedDirectionalLoss(**loss_kwargs)
-
-            def loss_fn(preds, labels):
-                targets = F.normalize(labels[:, 1:4], p=2, dim=1)
-                return mixed_loss(preds, targets)
-
-            loss_fn.set_epoch_progress = mixed_loss.set_epoch_progress  # type: ignore[attr-defined]
-            loss_fn.current_weights = mixed_loss.current_weights  # type: ignore[attr-defined]
-            return loss_fn
-
-    if task == "energy_reco":
-        if loss_name == "gaussian_nll":
-            return lambda preds, labels: gaussian_nll_loss(preds[:, 0], preds[:, 1], labels[:, 0])
-        if loss_name == "mse":
-            return lambda preds, labels: F.mse_loss(preds[:, 0], labels[:, 0])
-
-    if task == "starting_classification":
-        if loss_name != "bce":
-            raise ValueError("starting_classification currently supports only the 'bce' loss")
-
-        def loss_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1).float()
-            return F.binary_cross_entropy_with_logits(logits, targets)
-
-        return loss_fn
-
-    if task == "morphology_classification":
-        if loss_name != "cross_entropy":
-            raise ValueError("morphology_classification currently supports only the 'cross_entropy' loss")
-
-        def loss_fn(preds, labels):
-            targets = labels[:, 4].long()
-            return F.cross_entropy(preds, targets)
-
-        return loss_fn
-
-    if task == "track_cascade_classification":
-        if loss_name != "bce":
-            raise ValueError("track_cascade_classification currently supports only the 'bce' loss")
-
-        def loss_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = (labels[:, 4] == 0).float()
-            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=torch.tensor(10.0))
-
-        return loss_fn
-
-    raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
-
-
-def build_metric_function(task: str):
-    if task == "angular_reco":
-        def metric_fn(preds, labels):
-            target_dirs = F.normalize(labels[:, 1:4], p=2, dim=1)
-            preds_norm = F.normalize(preds, p=2, dim=1)
-            errors = angular_distance_loss(preds_norm, target_dirs, reduction="none")
-            errors_rad = errors * torch.pi
-            return {
-                "mean_angular_error_deg": torch.rad2deg(errors_rad.mean()).item(),
-                "median_angular_error_deg": torch.rad2deg(torch.median(errors_rad)).item(),
-            }
-        return metric_fn
-
-    if task == "energy_reco":
-        def metric_fn(preds, labels):
-            energy_errors = torch.abs(preds[:, 0] - labels[:, 0])
-            return {"mean_energy_error": energy_errors.mean().item()}
-        return metric_fn
-    if task == "starting_classification":
-        def metric_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1)
-            probs = torch.sigmoid(logits)
-            preds_binary = (probs >= 0.5).float()
-            accuracy = (preds_binary == targets).float().mean().item()
-            return {"accuracy": accuracy}
-        return metric_fn
-
-    if task == "morphology_classification":
-        def metric_fn(preds, labels):
-            targets = labels[:, 4].long()
-            probs = torch.softmax(preds, dim=1)
-            pred_classes = probs.argmax(dim=1)
-            accuracy = (pred_classes == targets).float().mean().item()
-            return {"accuracy": accuracy}
-        return metric_fn
-
-    if task == "track_cascade_classification":
-        def metric_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = (labels[:, 4] == 0).float()
-            probs = torch.sigmoid(logits)
-            preds_binary = (probs >= 0.5).float()
-            accuracy = (preds_binary == targets).float().mean().item()
-            return {"accuracy": accuracy}
-        return metric_fn
-
-    return None
-
-
-def prepare_batch(
-    coords_b: torch.Tensor, features_b: torch.Tensor, labels_b: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_ids = coords_b[:, 0].long()
-    if coords_b.size(1) < 5:
-        spatial = coords_b[:, 1:4]
-        time_column = torch.zeros_like(spatial[:, :1])
-        coords = torch.cat([spatial, time_column], dim=1)
-    else:
-        coords = coords_b[:, 1:5]
-    return coords, features_b, batch_ids, labels_b
-
-
-def main() -> None:
+def main():
+    torch.set_float32_matmul_precision('medium')
     args = parse_args()
-    cfg = load_config(args.cfg_file)
-    normalize_config(cfg)
-    model_opts = cfg["model_options"]
 
-    if model_opts.get("downstream_task") == "starting_classification":
-        cfg["task"] = "starting_classification"
-        cfg.setdefault("data_options", {})
-        cfg["data_options"]["task"] = "starting_classification"
+    with open(args.cfg_file, "r") as f:
+        cfg = yaml.safe_load(f)
+    
+    if args.run_checklist:
+        dm = ParquetDataModule(cfg)
+        run_checklist(dm)
+        return # Exit after checklist is complete
 
-    device = select_device(cfg)
-    print(f"Using device: {device}")
+    # DataModule
+    dm = ParquetDataModule(cfg)
 
-    train_loader, val_loader = create_dataloaders(cfg)
-
-    model = build_model(model_opts, device)
-    loss_fn = build_loss_function(model_opts)
-    metric_fn = build_metric_function(model_opts["downstream_task"])
-
-    use_wandb = False if args.no_wandb else setup_wandb(cfg)
-
-    trainer = Trainer(
-        model=model,
-        device=device,
-        cfg=cfg,
-        loss_fn=loss_fn,
-        metric_fn=metric_fn,
-        batch_prep_fn=prepare_batch,
-        use_wandb=use_wandb,
+    # LightningModule
+    model = NeptuneLightningModule(
+        model_options=cfg['model_options'],
+        training_options=cfg['training_options']
     )
 
-    checkpoint_path = cfg.get("checkpoint")
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint: {checkpoint_path}")
-        trainer.load_checkpoint(checkpoint_path, resume_training=cfg.get("resume_training", False))
+    # Logger
+    run_name = cfg.get("project_name", "whams-neptune-run")
+    wandb_logger = WandbLogger(
+        name=run_name,
+        id=run_name,
+        project="WHAMS",  # Use "WHAMS" as the main project name
+        save_dir=cfg.get("project_save_dir", "."),
+        config=cfg,
+        resume="allow"
+    )
 
-    if cfg.get("training", True):
-        trainer.fit(train_loader, val_loader)
-    else:
-        trainer.test(val_loader)
+    # Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(wandb_logger.experiment.dir, "checkpoints"),
+        filename='{epoch:02d}-{val_loss:.4f}',
+        monitor='val_loss',
+        mode='min',
+        save_top_k=3,
+    )
+    lr_monitor = LearningRateMonitor(logging_interval='step')
 
+    # Trainer
+    trainer = pl.Trainer(
+        accelerator=cfg.get("accelerator", "auto"),
+        devices=cfg.get("num_devices", 1),
+        max_epochs=cfg['training_options']['epochs'],
+        logger=wandb_logger,
+        callbacks=[checkpoint_callback, lr_monitor],
+        log_every_n_steps=cfg['training_options'].get("log_every_n_steps", 10)
+    )
+
+    # Start training
+    trainer.fit(model, datamodule=dm)
 
 if __name__ == "__main__":
     main()
