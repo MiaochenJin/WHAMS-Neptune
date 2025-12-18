@@ -37,6 +37,8 @@ dev = [
     "black>=22.0",
     "isort>=5.0",
     "flake8>=4.0",
+    "scikit-learn",
+    "matplotlib"
 ]
 
 [project.urls]

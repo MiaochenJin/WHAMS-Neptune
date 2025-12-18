@@ -62,17 +62,24 @@ class ParquetDataset(Dataset):
         'mc_event_morphology'
     ]
 
-    def __init__(self, files: List[str], morph_map: Optional[Dict[str, int]] = None):
+    def __init__(self, files: List[str], morph_map: Optional[Dict[str, int]] = None, raw_morph_map: Optional[Dict[str, int]] = None, limit_per_file: Optional[int] = None):
         self.files = files
+        self.limit_per_file = limit_per_file
         self.cumulative_lengths = []
         self._calculate_cumulative_lengths()
         
         self.current_file_index = -1
         self.current_data = None
         self.morphology_map = morph_map if morph_map is not None else {'Track': 0, 'Cascade': 1, 'Mixed': 2}
+        self.raw_morphology_map = raw_morph_map
 
     def _calculate_cumulative_lengths(self):
-        num_events = [pq.ParquetFile(f).metadata.num_rows for f in self.files]
+        num_events = []
+        for f in self.files:
+            n = pq.ParquetFile(f).metadata.num_rows
+            if self.limit_per_file is not None:
+                n = min(n, self.limit_per_file)
+            num_events.append(n)
         self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
         self.dataset_size = self.cumulative_lengths[-1]
 
@@ -126,8 +133,12 @@ class ParquetDataset(Dataset):
             warnings.warn(f"Unknown morphology '{morphology_str}' encountered. Defaulting to 0 (Background).")
             morphology_label = 0
             
+        raw_morph_idx = -1
+        if self.raw_morphology_map is not None:
+             raw_morph_idx = self.raw_morphology_map.get(morphology_str, -1)
+
         labels = torch.tensor([[
-            log_energy, dir_x, dir_y, dir_z, morphology_label
+            log_energy, dir_x, dir_y, dir_z, morphology_label, raw_morph_idx
         ]], dtype=torch.float32)
 
         return coords, features, labels
@@ -166,8 +177,17 @@ class ParquetDataModule(pl.LightningDataModule):
             self.val_files = sorted([f for pattern in valid_patterns for f in glob.glob(pattern)])
 
         morph_map = data_opts.get("morphology_mapping")
-        self.train_dataset = ParquetDataset(self.train_files, morph_map=morph_map)
-        self.val_dataset = ParquetDataset(self.val_files, morph_map=morph_map)
+        limit_per_file = data_opts.get("limit_per_file")
+        
+        # Create a raw morphology map to track original string labels
+        # We sort keys to ensure deterministic mapping
+        raw_morph_map = None
+        if morph_map:
+            raw_keys = sorted(list(morph_map.keys()))
+            raw_morph_map = {k: i for i, k in enumerate(raw_keys)}
+
+        self.train_dataset = ParquetDataset(self.train_files, morph_map=morph_map, raw_morph_map=raw_morph_map, limit_per_file=limit_per_file)
+        self.val_dataset = ParquetDataset(self.val_files, morph_map=morph_map, raw_morph_map=raw_morph_map, limit_per_file=limit_per_file)
 
     def _create_dataloader(self, dataset, shuffle):
         sampler = ParquetFileSampler(dataset, dataset.cumulative_lengths, shuffle_files=shuffle)

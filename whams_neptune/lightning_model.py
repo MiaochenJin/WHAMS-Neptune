@@ -56,6 +56,9 @@ class NeptuneLightningModule(pl.LightningModule):
         
         self.validation_step_outputs = []
 
+    def forward(self, coords, features, batch_ids):
+        return self.model(coords, features, batch_ids)
+
     def _get_loss_function(self):
         task = self.hparams.model_options['downstream_task']
         loss_choice = self.hparams.model_options['loss_fn']
