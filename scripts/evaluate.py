@@ -272,7 +272,11 @@ def main():
         )
 
         # Calculate cosine of zenith angles
-        true_cos_zenith = true_dirs[:, 2].numpy()
+        # True zenith must be calculated from the full vector
+        true_zenith_rad = np.arccos(true_dirs[:, 2].numpy())
+        true_cos_zenith = np.cos(true_zenith_rad)
+        
+        # Predicted zenith can be taken directly from the z-component of the normalized vector
         pred_cos_zenith = pred_dirs[:, 2].numpy()
 
         plot_zenith_distribution(
