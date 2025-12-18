@@ -18,7 +18,7 @@ from whams_neptune.dataloaders.parquet_dataset import ParquetDataModule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune Training with PyTorch Lightning")
-    parser.add_argument("-c", "--cfg_file", required=True, help="Path to YAML config")
+    parser.add_argument("-cfg", "--cfg_file", required=True, help="Path to YAML config")
     parser.add_argument("--run-checklist", action="store_true", help="Run data and model checks before training.")
     return parser.parse_args()
 
@@ -70,22 +70,30 @@ def main():
 
     # Logger
     run_name = cfg.get("project_name", "whams-neptune-run")
+    # Create a unique directory for this run
+    save_dir = Path(cfg.get("project_save_dir", "checkpoints")) / run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy config file to the run directory
+    import shutil
+    shutil.copy(args.cfg_file, save_dir / "config.yaml")
+
     wandb_logger = WandbLogger(
         name=run_name,
         id=run_name,
         project="WHAMS",  # Use "WHAMS" as the main project name
-        save_dir=cfg.get("project_save_dir", "."),
+        save_dir=str(save_dir),
         config=cfg,
         resume="allow"
     )
 
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join(wandb_logger.experiment.dir, "checkpoints"),
-        filename='{epoch:02d}-{val_loss:.4f}',
+        dirpath=str(save_dir),
+        filename='best_checkpoint',
         monitor='val_loss',
         mode='min',
-        save_top_k=3,
+        save_top_k=1,
     )
     lr_monitor = LearningRateMonitor(logging_interval='step')
 

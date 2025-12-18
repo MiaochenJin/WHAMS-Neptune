@@ -39,6 +39,32 @@ def plot_confusion_matrix(cm, x_labels, y_labels, output_path):
     plt.close()
     print(f"Saved confusion matrix to {output_path}")
 
+def plot_angular_error_distribution(angular_errors_deg, output_path):
+    plt.figure(figsize=(10, 6))
+    sns.histplot(angular_errors_deg, bins=50, kde=True)
+    plt.xlabel("Angular Error (degrees)")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Angular Reconstruction Error")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved angular error distribution to {output_path}")
+
+def plot_zenith_distribution(true_cos_zenith, pred_cos_zenith, output_path):
+    plt.figure(figsize=(10, 6))
+    sns.histplot(true_cos_zenith, bins=50, kde=True, color='blue', label='True Zenith', stat='density')
+    sns.histplot(pred_cos_zenith, bins=50, kde=True, color='red', label='Predicted Zenith', stat='density')
+    plt.xlabel("Cosine(Zenith Angle)")
+    plt.ylabel("Density")
+    plt.title("Distribution of True and Predicted Cosine(Zenith)")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved zenith angle distribution to {output_path}")
+
 def plot_roc_curve(y_true_one_hot, y_score, n_classes, class_labels, output_path):
     # Calculate ROC curve and AUC for each class
     fpr = dict()
@@ -125,11 +151,28 @@ def main():
     # We pass strict=False because sometimes checkpoints might have extra/missing keys 
     # if the model code changed slightly, but mainly to be robust. 
     # Ideally, we init with params from cfg.
-    model = NeptuneLightningModule.load_from_checkpoint(
-        args.checkpoint_path,
-        model_options=cfg['model_options'],
-        training_options=cfg['training_options']
-    )
+    try:
+        model = NeptuneLightningModule.load_from_checkpoint(
+            args.checkpoint_path,
+            model_options=cfg['model_options'],
+            training_options=cfg['training_options']
+        )
+    except KeyError as e:
+        if "pytorch-lightning_version" in str(e):
+            print("Detected checkpoint without Lightning metadata. Loading weights directly.")
+            model = NeptuneLightningModule(
+                model_options=cfg['model_options'],
+                training_options=cfg['training_options']
+            )
+            checkpoint = torch.load(args.checkpoint_path, map_location=lambda storage, loc: storage)
+            # Adjust key if necessary, e.g., if weights are nested under 'state_dict'
+            state_dict = checkpoint.get('state_dict', checkpoint)
+            # The lightning module nests the actual model, so we need to adjust keys
+            # from "layer.weight" to "model.layer.weight"
+            model_state_dict = {"model." + k: v for k, v in state_dict.items()}
+            model.load_state_dict(model_state_dict, strict=False)
+        else:
+            raise e
     model.eval()
     model.freeze()
     
@@ -137,9 +180,8 @@ def main():
     model.to(device)
 
     # 5. Inference
-    all_logits = []
-    all_raw_indices = []
-    all_mapped_targets = []
+    all_preds = []
+    all_labels = []
 
     print("Running inference on validation set...")
     with torch.no_grad():
@@ -147,84 +189,100 @@ def main():
             coords, features, labels, batch_ids = [t.to(device) for t in batch]
             
             # Forward pass
-            logits = model(coords, features, batch_ids)
+            preds = model(coords, features, batch_ids)
             
-            # labels structure: [log_energy, dir_x, dir_y, dir_z, morphology_label, raw_morph_idx]
-            # morphology_label (index 4) is the training target (0/1)
-            # raw_morph_idx (index 5) is the index into raw_labels
-            
-            targets_mapped = labels[:, 4].long().cpu().numpy()
-            
-            # Check if we have the 6th element (raw index)
-            if labels.shape[1] > 5:
-                raw_idx = labels[:, 5].long().cpu().numpy()
-            else:
-                # Fallback if dataset wasn't updated correctly or old cache?
-                # Should not happen if we updated ParquetDataset
-                raw_idx = np.full_like(targets_mapped, -1)
-                
-            all_logits.append(logits.cpu().numpy())
-            all_mapped_targets.append(targets_mapped)
-            all_raw_indices.append(raw_idx)
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
 
-    all_logits = np.concatenate(all_logits, axis=0)
-    all_mapped_targets = np.concatenate(all_mapped_targets, axis=0)
-    all_raw_indices = np.concatenate(all_raw_indices, axis=0)
+    all_preds = torch.cat(all_preds, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
 
-    # 6. Confusion Matrix (Raw Morphology vs Predicted Class)
-    pred_classes = np.argmax(all_logits, axis=1)
-    
-    n_raw = len(raw_labels)
-    n_pred = len(pred_labels)
-    
-    cm = np.zeros((n_raw, n_pred), dtype=int)
-    
-    for t, p in zip(all_raw_indices, pred_classes):
-        if t >= 0 and t < n_raw and p >= 0 and p < n_pred:
-            cm[t, p] += 1
-            
-    print("\n--- Confusion Matrix (Counts) ---")
-    print(cm)
-    
-    # Filter rows with zero events
-    row_sums = cm.sum(axis=1)
-    valid_rows = row_sums > 0
-    
-    cm_filtered = cm[valid_rows]
-    raw_labels_filtered = [label for i, label in enumerate(raw_labels) if valid_rows[i]]
-    row_sums_filtered = row_sums[valid_rows]
-    
-    if len(cm_filtered) == 0:
-        print("Warning: No events found for any morphology category.")
-    else:
-        # Normalize to percentage
-        # Avoid division by zero (though filtered rows shouldn't have sum 0)
-        cm_pct = (cm_filtered.astype('float') / row_sums_filtered[:, np.newaxis]) * 100
+    # 6. Evaluation based on task
+    task = cfg['model_options'].get('downstream_task')
+
+    if task == 'morphology_classification':
+        # Existing morphology evaluation logic
+        all_logits = all_preds.numpy()
+        all_mapped_targets = all_labels[:, 4].long().numpy()
+        all_raw_indices = all_labels[:, 5].long().numpy() if all_labels.shape[1] > 5 else np.full_like(all_mapped_targets, -1)
+
+        pred_classes = np.argmax(all_logits, axis=1)
         
-        print("\n--- Confusion Matrix (Percentage) ---")
-        print(cm_pct)
-
-        plot_confusion_matrix(
-            cm_pct,
-            x_labels=pred_labels,
-            y_labels=raw_labels_filtered,
-            output_path=os.path.join(args.output_dir, "confusion_matrix.png")
+        n_raw = len(raw_labels)
+        n_pred = len(pred_labels)
+        
+        cm = np.zeros((n_raw, n_pred), dtype=int)
+        
+        for t, p in zip(all_raw_indices, pred_classes):
+            if t >= 0 and t < n_raw and p >= 0 and p < n_pred:
+                cm[t, p] += 1
+                
+        print("\n--- Confusion Matrix (Counts) ---")
+        print(cm)
+        
+        row_sums = cm.sum(axis=1)
+        valid_rows = row_sums > 0
+        cm_filtered = cm[valid_rows]
+        raw_labels_filtered = [label for i, label in enumerate(raw_labels) if valid_rows[i]]
+        row_sums_filtered = row_sums[valid_rows]
+        
+        if len(cm_filtered) > 0:
+            cm_pct = (cm_filtered.astype('float') / row_sums_filtered[:, np.newaxis]) * 100
+            print("\n--- Confusion Matrix (Percentage) ---")
+            print(cm_pct)
+            plot_confusion_matrix(
+                cm_pct,
+                x_labels=pred_labels,
+                y_labels=raw_labels_filtered,
+                output_path=os.path.join(args.output_dir, "confusion_matrix.png")
+            )
+        
+        y_true_one_hot = np.eye(len(pred_labels))[all_mapped_targets]
+        probs = torch.softmax(all_preds, dim=1).numpy()
+        plot_roc_curve(
+            y_true_one_hot,
+            probs,
+            len(pred_labels),
+            pred_labels,
+            os.path.join(args.output_dir, "roc_curve.png")
         )
-    
-    # 7. ROC Curves (using mapped training targets)
-    # We compute ROC against the binary/coarse targets used for training
-    y_true_one_hot = np.eye(len(pred_labels))[all_mapped_targets]
-    
-    # Softmax for probabilities
-    probs = torch.softmax(torch.from_numpy(all_logits), dim=1).numpy()
-    
-    plot_roc_curve(
-        y_true_one_hot, 
-        probs, 
-        len(pred_labels), 
-        pred_labels, 
-        os.path.join(args.output_dir, "roc_curve.png")
-    )
+
+    elif task == 'angular_reco':
+        from whams_neptune.losses.vmf import angular_distance_loss
+        
+        true_dirs = all_labels[:, 1:4]
+        # Normalize predictions
+        pred_dirs = torch.nn.functional.normalize(all_preds, p=2, dim=1)
+        
+        angular_errors_rad = angular_distance_loss(pred_dirs, true_dirs, reduction='none')
+        angular_errors_deg = np.rad2deg(angular_errors_rad.numpy())
+        
+        median_error = np.median(angular_errors_deg)
+        mean_error = np.mean(angular_errors_deg)
+        std_error = np.std(angular_errors_deg)
+        
+        print("\n--- Angular Reconstruction Metrics ---")
+        print(f"Median Angular Error: {median_error:.4f} degrees")
+        print(f"Mean Angular Error:   {mean_error:.4f} degrees")
+        print(f"Std Dev of Error:   {std_error:.4f} degrees")
+
+        plot_angular_error_distribution(
+            angular_errors_deg,
+            output_path=os.path.join(args.output_dir, "angular_error_distribution.png")
+        )
+
+        # Calculate cosine of zenith angles
+        true_cos_zenith = true_dirs[:, 2].numpy()
+        pred_cos_zenith = pred_dirs[:, 2].numpy()
+
+        plot_zenith_distribution(
+            true_cos_zenith,
+            pred_cos_zenith,
+            output_path=os.path.join(args.output_dir, "zenith_distribution.png")
+        )
+
+    else:
+        print(f"Evaluation for task '{task}' is not implemented.")
 
     print("\nEvaluation complete.")
 

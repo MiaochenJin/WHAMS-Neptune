@@ -175,6 +175,7 @@ class ParquetDataModule(pl.LightningDataModule):
 
         morph_map = data_opts.get("morphology_mapping")
         rescale = data_opts.get("rescale", False)
+        if rescale: print("Rescaling of features is enabled.")
         self.train_dataset = ParquetDataset(self.train_files, morph_map=morph_map, rescale=rescale)
         self.val_dataset = ParquetDataset(self.val_files, morph_map=morph_map, rescale=rescale)
 
