@@ -62,18 +62,31 @@ class ParquetDataset(Dataset):
         'mc_event_morphology'
     ]
 
-    def __init__(self, files: List[str], morph_map: Optional[Dict[str, int]] = None, rescale: bool = False):
+    def __init__(self, files: List[str], morph_map: Optional[Dict[str, int]] = None, raw_morph_map: Optional[Dict[str, int]] = None, limit_per_file: Optional[int] = 10, rescale: bool = False, additional_columns: Optional[List[str]] = None):
         self.files = files
         self.cumulative_lengths = []
+        self.limit_per_file = limit_per_file
         self._calculate_cumulative_lengths()
         
         self.current_file_index = -1
         self.current_data = None
         self.morphology_map = morph_map if morph_map is not None else {'Track': 0, 'Cascade': 1, 'Mixed': 2}
+        self.raw_morphology_map = raw_morph_map
         self.rescale = rescale
+        
+        self.columns_to_load = list(self.REQUIRED_COLUMNS)
+        if additional_columns:
+            for col in additional_columns:
+                if col not in self.columns_to_load:
+                    self.columns_to_load.append(col)
 
     def _calculate_cumulative_lengths(self):
-        num_events = [pq.ParquetFile(f).metadata.num_rows for f in self.files]
+        num_events = []
+        for f in self.files:
+            n = pq.ParquetFile(f).metadata.num_rows
+            if self.limit_per_file is not None:
+                n = min(n, self.limit_per_file)
+            num_events.append(n)
         self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
         self.dataset_size = self.cumulative_lengths[-1]
 
@@ -89,7 +102,7 @@ class ParquetDataset(Dataset):
         if file_index != self.current_file_index:
             self.current_file_index = file_index
             # Only read required columns to avoid issues with extra columns like 'whams-bdt'
-            self.current_data = ak.from_parquet(self.files[file_index], columns=self.REQUIRED_COLUMNS)
+            self.current_data = ak.from_parquet(self.files[file_index], columns=self.columns_to_load)
             
         local_idx = idx - self.cumulative_lengths[file_index]
         event = self.current_data[local_idx]
@@ -133,10 +146,20 @@ class ParquetDataset(Dataset):
         if morphology_label == -1:
             warnings.warn(f"Unknown morphology '{morphology_str}' encountered. Defaulting to 0 (Background).")
             morphology_label = 0
-            
-        labels = torch.tensor([[
-            log_energy, dir_x, dir_y, dir_z, morphology_label
-        ]], dtype=torch.float32)
+        
+        raw_morph_idx = -1
+        if self.raw_morphology_map is not None:
+             raw_morph_idx = self.raw_morphology_map.get(morphology_str, -1)
+
+        labels_list = [log_energy, dir_x, dir_y, dir_z, morphology_label, raw_morph_idx]
+
+        if 'physics_vertex_position' in self.columns_to_load:
+             vtx_pos = ak.to_numpy(event['physics_vertex_position']).astype(np.float32)
+             if self.rescale:
+                  vtx_pos = vtx_pos * 1e-3
+             labels_list.extend([vtx_pos[0], vtx_pos[1], vtx_pos[2]])
+
+        labels = torch.tensor([labels_list], dtype=torch.float32)
 
         return coords, features, labels
 
@@ -156,10 +179,33 @@ class ParquetDataModule(pl.LightningDataModule):
         elif "data_paths" in data_opts:
             all_patterns = data_opts["data_paths"]
             val_split = data_opts.get("val_split", 0.1)
+            files_per_dir = data_opts.get("files_per_dir")
+            seed = data_opts.get("seed", 42)
+
+            all_files = []
+            if files_per_dir:
+                # Group files by directory
+                dir_files = {}
+                for pattern in all_patterns:
+                    files = glob.glob(pattern)
+                    for f in files:
+                        dir_name = os.path.dirname(f)
+                        if dir_name not in dir_files:
+                            dir_files[dir_name] = []
+                        dir_files[dir_name].append(f)
+                
+                # Seed for reproducibility
+                np.random.seed(seed)
+                for dir_name in dir_files:
+                    files = dir_files[dir_name]
+                    if len(files) > files_per_dir:
+                        files = np.random.choice(files, files_per_dir, replace=False).tolist()
+                    all_files.extend(files)
+                all_files = sorted(all_files)
+            else:
+                all_files = sorted([f for pattern in all_patterns for f in glob.glob(pattern)])
             
-            all_files = sorted([f for pattern in all_patterns for f in glob.glob(pattern)])
-            
-            np.random.seed(data_opts.get("seed", 42))
+            np.random.seed(seed)
             np.random.shuffle(all_files)
             
             split_idx = int(len(all_files) * (1 - val_split))
@@ -175,9 +221,23 @@ class ParquetDataModule(pl.LightningDataModule):
 
         morph_map = data_opts.get("morphology_mapping")
         rescale = data_opts.get("rescale", False)
+        limit_per_file = data_opts.get("limit_per_file")
+        # Create a raw morphology map to track original string labels
+        # We sort keys to ensure deterministic mapping
+        raw_morph_map = None
+        if morph_map:
+            raw_keys = sorted(list(morph_map.keys()))
+            raw_morph_map = {k: i for i, k in enumerate(raw_keys)}
         if rescale: print("Rescaling of features is enabled.")
-        self.train_dataset = ParquetDataset(self.train_files, morph_map=morph_map, rescale=rescale)
-        self.val_dataset = ParquetDataset(self.val_files, morph_map=morph_map, rescale=rescale)
+        
+        # Determine additional columns based on task
+        additional_columns = []
+        task = self.cfg.get('model_options', {}).get('downstream_task', '')
+        if task == 'vertex_reco':
+            additional_columns.append('physics_vertex_position')
+            
+        self.train_dataset = ParquetDataset(self.train_files, morph_map=morph_map, rescale=rescale, limit_per_file=limit_per_file, raw_morph_map=raw_morph_map, additional_columns=additional_columns)
+        self.val_dataset = ParquetDataset(self.val_files, morph_map=morph_map, rescale=rescale, limit_per_file=limit_per_file, raw_morph_map=raw_morph_map, additional_columns=additional_columns)
 
     def _create_dataloader(self, dataset, shuffle):
         sampler = ParquetFileSampler(dataset, dataset.cumulative_lengths, shuffle_files=shuffle)

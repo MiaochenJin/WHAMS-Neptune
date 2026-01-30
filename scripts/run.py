@@ -19,6 +19,7 @@ from whams_neptune.dataloaders.parquet_dataset import ParquetDataModule
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune Training with PyTorch Lightning")
     parser.add_argument("-cfg", "--cfg_file", required=True, help="Path to YAML config")
+    parser.add_argument("-ckpt", "--checkpoint", help="Path to checkpoint to resume/fine-tune from")
     parser.add_argument("--run-checklist", action="store_true", help="Run data and model checks before training.")
     return parser.parse_args()
 
@@ -63,10 +64,19 @@ def main():
     dm = ParquetDataModule(cfg)
 
     # LightningModule
-    model = NeptuneLightningModule(
-        model_options=cfg['model_options'],
-        training_options=cfg['training_options']
-    )
+    if args.checkpoint:
+        print(f"Loading model from checkpoint: {args.checkpoint}")
+        model = NeptuneLightningModule.load_from_checkpoint(
+            args.checkpoint,
+            model_options=cfg['model_options'],
+            training_options=cfg['training_options'],
+            strict=False
+        )
+    else:
+        model = NeptuneLightningModule(
+            model_options=cfg['model_options'],
+            training_options=cfg['training_options']
+        )
 
     # Logger
     run_name = cfg.get("project_name", "whams-neptune-run")
@@ -94,6 +104,7 @@ def main():
         monitor='val_loss',
         mode='min',
         save_top_k=1,
+        save_last=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
