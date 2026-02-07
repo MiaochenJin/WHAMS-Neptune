@@ -8,6 +8,7 @@ for fast, efficient training.
 This module provides:
 - MmapDataset: Main dataset class compatible with existing Neptune training
 - MmapDataModule: PyTorch Lightning DataModule wrapper
+- WeightingConfig: Configuration for weighted sampling of high-E upgoing events
 
 The output format matches ParquetDataset for drop-in compatibility:
 - coords: (N, 4) tensor of [x, y, z, t_first]
@@ -16,12 +17,13 @@ The output format matches ParquetDataset for drop-in compatibility:
 """
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from .mmap_format import (
     WHAMS_EVENT_RECORD_DTYPE,
@@ -33,6 +35,46 @@ from .mmap_format import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Weighting Configuration
+# =============================================================================
+
+
+@dataclass
+class WeightingConfig:
+    """Configuration for weighted sampling during training.
+
+    This implements energy-dependent weighting for upgoing starting events
+    to address the deficit of high-energy upgoing events in training data.
+
+    Weight formula:
+        For starting events (morphology_label == 1) with dir_z > 0 (upgoing):
+            - energy >= e_very_high: w_very_high_upgoing
+            - energy >= e_high:      w_high_upgoing
+            - energy >= e_med:       w_med_upgoing
+            - else:                  w_default
+        For all other events: w_default
+
+    Args:
+        enabled: Whether to use weighted sampling (default False)
+        e_very_high: Very high energy threshold in GeV (default 1e6 = 1 PeV)
+        e_high: High energy threshold in GeV (default 1e5 = 100 TeV)
+        e_med: Medium energy threshold in GeV (default 1e4 = 10 TeV)
+        w_very_high_upgoing: Weight for very high energy upgoing starting (default 20.0)
+        w_high_upgoing: Weight for high energy upgoing starting (default 10.0)
+        w_med_upgoing: Weight for medium energy upgoing starting (default 3.0)
+        w_default: Default weight for all other events (default 1.0)
+    """
+    enabled: bool = False
+    e_very_high: float = 1e6   # 1 PeV in GeV
+    e_high: float = 1e5        # 100 TeV in GeV
+    e_med: float = 1e4         # 10 TeV in GeV
+    w_very_high_upgoing: float = 20.0
+    w_high_upgoing: float = 10.0
+    w_med_upgoing: float = 3.0
+    w_default: float = 1.0
 
 
 # =============================================================================
@@ -250,20 +292,36 @@ class MmapDataset(Dataset):
 
     def _create_split(self):
         """Create train/val split indices."""
-        # Create reproducible random split
+        # Filter out events with 0 sensors (would cause batch size mismatch)
+        valid_indices = []
+        n_empty = 0
+        for global_idx in range(self.total_events):
+            file_idx, local_idx = self._get_file_and_local_idx(global_idx)
+            event = self.event_records_list[file_idx][local_idx]
+            n_sensors = int(event["num_sensors"])
+            if n_sensors > 0:
+                valid_indices.append(global_idx)
+            else:
+                n_empty += 1
+
+        if n_empty > 0:
+            logger.warning(f"Filtered out {n_empty} events with 0 sensors")
+
+        # Create reproducible random split from valid indices only
         rng = np.random.default_rng(self.split_seed)
-        indices = np.arange(self.total_events)
+        indices = np.array(valid_indices)
         rng.shuffle(indices)
 
-        n_val = int(self.total_events * self.val_split)
-        n_train = self.total_events - n_val
+        n_valid = len(indices)
+        n_val = int(n_valid * self.val_split)
+        n_train = n_valid - n_val
 
         if self.split == "train":
             self.indices = indices[:n_train]
         elif self.split == "val":
             self.indices = indices[n_train:]
-        else:  # "full"
-            self.indices = np.arange(self.total_events)
+        else:  # "full" - use all valid indices (unshuffled for reproducibility)
+            self.indices = np.array(valid_indices)
 
     def _get_file_and_local_idx(self, global_idx: int) -> Tuple[int, int]:
         """Convert global index to (file_idx, local_idx)."""
@@ -296,9 +354,10 @@ class MmapDataset(Dataset):
         # Get event record
         event = self.event_records_list[file_idx][local_idx]
 
-        # Get sensor range (adjust for file's sensor offset)
-        sensor_start = int(event["sensor_start_idx"]) - self.sensor_offsets[file_idx]
-        sensor_end = int(event["sensor_end_idx"]) - self.sensor_offsets[file_idx]
+        # Get sensor range - indices are LOCAL to each file's .dat, no offset needed
+        # (Previous bug: subtracting sensor_offsets caused wrong indices for non-first files)
+        sensor_start = int(event["sensor_start_idx"])
+        sensor_end = int(event["sensor_end_idx"])
         n_sensors = sensor_end - sensor_start
 
         # Get sensor data
@@ -377,13 +436,129 @@ class MmapDataset(Dataset):
             "dataset_id": int(event["dataset_id"]),
         }
 
+    def compute_sample_weights(self, weighting_config: WeightingConfig) -> np.ndarray:
+        """Compute sample weights for WeightedRandomSampler.
+
+        This iterates through all events in the dataset (respecting the split)
+        and computes weights based on energy, direction, and morphology.
+
+        Args:
+            weighting_config: WeightingConfig with thresholds and weights
+
+        Returns:
+            numpy array of weights with shape (len(self),)
+        """
+        logger.info("Computing sample weights for weighted sampling...")
+
+        weights = np.ones(len(self), dtype=np.float64)
+
+        # Counters for logging
+        n_very_high_upgoing = 0
+        n_high_upgoing = 0
+        n_med_upgoing = 0
+        n_starting_downgoing = 0
+        n_background = 0
+
+        for idx in range(len(self)):
+            global_idx = self.indices[idx]
+            file_idx, local_idx = self._get_file_and_local_idx(global_idx)
+            event = self.event_records_list[file_idx][local_idx]
+
+            # Get event properties
+            energy = float(event["mc_primary_energy"])  # in GeV
+            dir_z = float(event["mc_primary_dir_z"])
+            raw_morph_idx = int(event["morphology_raw"])
+            morphology_label = self.morphology_mapping.get(raw_morph_idx, 0.0)
+
+            # Default weight
+            weight = weighting_config.w_default
+
+            # Only apply higher weights to starting events (morphology_label == 1)
+            is_starting = (morphology_label == 1.0)
+            is_upgoing = (dir_z > 0)
+
+            if is_starting and is_upgoing:
+                if energy >= weighting_config.e_very_high:
+                    weight = weighting_config.w_very_high_upgoing
+                    n_very_high_upgoing += 1
+                elif energy >= weighting_config.e_high:
+                    weight = weighting_config.w_high_upgoing
+                    n_high_upgoing += 1
+                elif energy >= weighting_config.e_med:
+                    weight = weighting_config.w_med_upgoing
+                    n_med_upgoing += 1
+            elif is_starting:
+                n_starting_downgoing += 1
+            else:
+                n_background += 1
+
+            weights[idx] = weight
+
+        # Cache the weights
+        self._sample_weights = weights
+        self._weighting_config = weighting_config
+
+        # Log statistics
+        self._log_weight_statistics(
+            n_very_high_upgoing, n_high_upgoing, n_med_upgoing,
+            n_starting_downgoing, n_background, weighting_config
+        )
+
+        return weights
+
+    def _log_weight_statistics(
+        self,
+        n_very_high_upgoing: int,
+        n_high_upgoing: int,
+        n_med_upgoing: int,
+        n_starting_downgoing: int,
+        n_background: int,
+        cfg: WeightingConfig,
+    ):
+        """Log weight statistics for debugging and verification."""
+        total = len(self)
+
+        # Compute effective sample sizes
+        eff_very_high = n_very_high_upgoing * cfg.w_very_high_upgoing
+        eff_high = n_high_upgoing * cfg.w_high_upgoing
+        eff_med = n_med_upgoing * cfg.w_med_upgoing
+        eff_other = (n_starting_downgoing + n_background) * cfg.w_default
+
+        total_weight = eff_very_high + eff_high + eff_med + eff_other
+
+        logger.info("=" * 60)
+        logger.info("Sample Weight Statistics:")
+        logger.info("=" * 60)
+        logger.info(f"Total events: {total}")
+        logger.info("")
+        logger.info("Category counts and weights:")
+        logger.info(f"  >1 PeV upgoing starting:   {n_very_high_upgoing:>8} x {cfg.w_very_high_upgoing:>5.1f} = {eff_very_high:>10.1f}")
+        logger.info(f"  100TeV-1PeV upgoing start: {n_high_upgoing:>8} x {cfg.w_high_upgoing:>5.1f} = {eff_high:>10.1f}")
+        logger.info(f"  10-100TeV upgoing start:   {n_med_upgoing:>8} x {cfg.w_med_upgoing:>5.1f} = {eff_med:>10.1f}")
+        logger.info(f"  Starting downgoing:        {n_starting_downgoing:>8} x {cfg.w_default:>5.1f} = {n_starting_downgoing * cfg.w_default:>10.1f}")
+        logger.info(f"  Background:                {n_background:>8} x {cfg.w_default:>5.1f} = {n_background * cfg.w_default:>10.1f}")
+        logger.info("")
+        logger.info(f"Total effective weight: {total_weight:.1f}")
+        logger.info("")
+        logger.info("Sampling probabilities per category:")
+        if total_weight > 0:
+            logger.info(f"  >1 PeV upgoing:            {100 * eff_very_high / total_weight:>6.2f}%")
+            logger.info(f"  100TeV-1PeV upgoing:       {100 * eff_high / total_weight:>6.2f}%")
+            logger.info(f"  10-100TeV upgoing:         {100 * eff_med / total_weight:>6.2f}%")
+            logger.info(f"  Other events:              {100 * eff_other / total_weight:>6.2f}%")
+        logger.info("=" * 60)
+
+    def get_sample_weights(self) -> Optional[np.ndarray]:
+        """Return cached sample weights, or None if not computed."""
+        return getattr(self, "_sample_weights", None)
+
 
 # =============================================================================
 # DataModule (PyTorch Lightning)
 # =============================================================================
 
 try:
-    import pytorch_lightning as pl
+    import lightning.pytorch as pl
 
     class MmapDataModule(pl.LightningDataModule):
         """PyTorch Lightning DataModule for WHAMS mmap data.
@@ -402,6 +577,9 @@ try:
             rescale_params: Rescaling parameters
             morphology_mapping: Dict mapping raw morphology index to class label.
                                See MmapDataset docstring for details.
+            weighting_config: Optional WeightingConfig for weighted sampling.
+                             If provided and enabled, uses WeightedRandomSampler
+                             to oversample high-energy upgoing starting events.
         """
 
         def __init__(
@@ -416,6 +594,7 @@ try:
             rescale_params: Optional[Dict] = None,
             pin_memory: bool = True,
             morphology_mapping: Optional[Dict[int, float]] = None,
+            weighting_config: Optional[WeightingConfig] = None,
         ):
             super().__init__()
             self.mmap_paths = mmap_paths
@@ -428,12 +607,15 @@ try:
             self.rescale_params = rescale_params
             self.pin_memory = pin_memory
             self.morphology_mapping = morphology_mapping
+            self.weighting_config = weighting_config
 
             self.train_dataset = None
             self.val_dataset = None
+            self._train_sampler = None
 
-            # Import collator from utils.collators (standard location in WHAMS-Neptune)
-            from whams_neptune.utils.collators import IrregularDataCollator
+            # Import collator from parquet_dataset (returns 4 values: coords, features, labels, batch_ids)
+            # Note: utils.collators.IrregularDataCollator returns only 3 values, which is incompatible
+            from whams_neptune.dataloaders.parquet_dataset import IrregularDataCollator
             self.collator = IrregularDataCollator()
 
         def setup(self, stage: Optional[str] = None):
@@ -452,18 +634,39 @@ try:
                 self.train_dataset = MmapDataset(split="train", **common_kwargs)
                 self.val_dataset = MmapDataset(split="val", **common_kwargs)
 
+                # Compute sample weights if weighting is enabled
+                if self.weighting_config and self.weighting_config.enabled:
+                    weights = self.train_dataset.compute_sample_weights(self.weighting_config)
+                    self._train_sampler = WeightedRandomSampler(
+                        weights=weights,
+                        num_samples=len(weights),
+                        replacement=True,
+                    )
+                    logger.info("WeightedRandomSampler created for training")
+
             if stage == "test" or stage is None:
                 self.test_dataset = MmapDataset(split="full", **common_kwargs)
 
         def train_dataloader(self) -> DataLoader:
-            return DataLoader(
-                self.train_dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers,
-                collate_fn=self.collator,
-                pin_memory=self.pin_memory,
-            )
+            # Use weighted sampler if available, otherwise shuffle
+            if self._train_sampler is not None:
+                return DataLoader(
+                    self.train_dataset,
+                    batch_size=self.batch_size,
+                    sampler=self._train_sampler,
+                    num_workers=self.num_workers,
+                    collate_fn=self.collator,
+                    pin_memory=self.pin_memory,
+                )
+            else:
+                return DataLoader(
+                    self.train_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=True,
+                    num_workers=self.num_workers,
+                    collate_fn=self.collator,
+                    pin_memory=self.pin_memory,
+                )
 
         def val_dataloader(self) -> DataLoader:
             return DataLoader(
