@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 from whams_neptune.lightning_model import NeptuneLightningModule
 from whams_neptune.dataloaders.parquet_dataset import ParquetDataModule
-from whams_neptune.dataloaders.mmap_dataset import MmapDataModule
+from whams_neptune.dataloaders.mmap_dataset import MmapDataModule, WeightingConfig
 
 
 def parse_args():
@@ -61,6 +61,28 @@ def run_checklist(dm):
     print("--- Checklist Complete ---")
 
 
+def parse_weighting_config(weighting_opts: dict) -> WeightingConfig:
+    """Parse weighting options from config into WeightingConfig dataclass.
+
+    Args:
+        weighting_opts: Dict with weighting options from YAML config
+
+    Returns:
+        WeightingConfig instance
+    """
+    # Convert to float explicitly since YAML may parse scientific notation as strings
+    return WeightingConfig(
+        enabled=weighting_opts.get("enabled", False),
+        e_very_high=float(weighting_opts.get("e_very_high", 1e6)),
+        e_high=float(weighting_opts.get("e_high", 1e5)),
+        e_med=float(weighting_opts.get("e_med", 1e4)),
+        w_very_high_upgoing=float(weighting_opts.get("w_very_high_upgoing", 20.0)),
+        w_high_upgoing=float(weighting_opts.get("w_high_upgoing", 10.0)),
+        w_med_upgoing=float(weighting_opts.get("w_med_upgoing", 3.0)),
+        w_default=float(weighting_opts.get("w_default", 1.0)),
+    )
+
+
 def create_datamodule(cfg):
     """Create the appropriate DataModule based on config.
 
@@ -77,6 +99,23 @@ def create_datamodule(cfg):
         if not mmap_paths:
             raise ValueError("data_options.mmap_paths required for mmap format")
 
+        # Parse weighting config if present
+        weighting_config = None
+        weighting_opts = data_options.get("weighting", {})
+        if weighting_opts.get("enabled", False):
+            weighting_config = parse_weighting_config(weighting_opts)
+            print(f"Weighted sampling enabled:")
+            print(f"  e_very_high={weighting_config.e_very_high:.0e} GeV, w={weighting_config.w_very_high_upgoing}")
+            print(f"  e_high={weighting_config.e_high:.0e} GeV, w={weighting_config.w_high_upgoing}")
+            print(f"  e_med={weighting_config.e_med:.0e} GeV, w={weighting_config.w_med_upgoing}")
+
+        # Parse morphology mapping if present (for multiclass training)
+        morphology_mapping = None
+        morph_opts = data_options.get("morphology_mapping", None)
+        if morph_opts is not None:
+            morphology_mapping = {int(k): float(v) for k, v in morph_opts.items()}
+            print(f"Morphology mapping: {morphology_mapping}")
+
         dm = MmapDataModule(
             mmap_paths=mmap_paths,
             batch_size=training_options.get("batch_size", 32),
@@ -84,6 +123,8 @@ def create_datamodule(cfg):
             split_seed=data_options.get("seed", 42),
             num_workers=training_options.get("num_workers", 4),
             rescale=data_options.get("rescale", False),
+            morphology_mapping=morphology_mapping,
+            weighting_config=weighting_config,
         )
     else:
         # Parquet data loading (original behavior)
