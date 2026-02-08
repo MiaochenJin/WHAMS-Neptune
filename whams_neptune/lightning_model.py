@@ -98,7 +98,7 @@ class NeptuneLightningModule(pl.LightningModule):
 
         elif task == 'morphology_classification':
             get_labels = lambda labels: labels[:, 4].long() # morphology_label
-            return lambda preds, labels: F.cross_entropy(preds, get_labels(labels))
+            return lambda preds, labels: F.cross_entropy(preds, get_labels(labels), ignore_index=-1)
             
         raise ValueError(f"Unsupported task/loss combination: {task}/{loss_choice}")
 
@@ -162,11 +162,16 @@ class NeptuneLightningModule(pl.LightningModule):
         elif task == 'morphology_classification':
             true_labels = all_labels[:, 4].long()
             predicted_labels = torch.argmax(all_preds, dim=1)
-            
+
+            # Filter out ignored labels (-1)
+            valid_mask = true_labels >= 0
+            true_labels = true_labels[valid_mask]
+            predicted_labels = predicted_labels[valid_mask]
+
             # Compute accuracy
             correct = (predicted_labels == true_labels).sum().float()
             accuracy = correct / len(true_labels)
-            
+
             self.log('val_accuracy', accuracy, prog_bar=True)
         
         self.validation_step_outputs.clear()

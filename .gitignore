@@ -1,5 +1,6 @@
 checkpoints/
 plots/
+
 __pycache__/
 neptune/__pycache__/
 neptune/*.pyc

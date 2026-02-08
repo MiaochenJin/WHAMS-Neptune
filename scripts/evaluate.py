@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from whams_neptune.lightning_model import NeptuneLightningModule
 from whams_neptune.dataloaders.parquet_dataset import ParquetDataModule
+from whams_neptune.dataloaders.mmap_dataset import MmapDataModule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune Model Evaluation")
@@ -646,33 +647,77 @@ def main():
     # 2. Extract Labels from Config
     data_opts = cfg.get("data_options", {})
     morph_map = data_opts.get("morphology_mapping", {})
-    
-    # Raw labels (Y-axis): sorted keys of morphology_mapping
-    raw_labels = sorted(list(morph_map.keys()))
-    
-    # Model/Predicted labels (X-axis): from plotting_morphology or inferred
-    # In whams-starting.cfg: plotting_morphology: {0: "Background", 1: "Starting"}
+
+    # Standard morphology names by raw index
+    RAW_MORPHOLOGY_NAMES = {
+        0: '0T0C', 1: '0T1C', 2: '0TnC', 3: '1T0C',
+        4: '1T1C', 5: '1TnC', 6: '2TnC', 7: 'Background',
+    }
+
+    # Raw labels (Y-axis): sorted keys of morphology_mapping, with names
+    raw_labels_idx = sorted(list(morph_map.keys()))
+    raw_labels = [RAW_MORPHOLOGY_NAMES.get(i, f"Morph {i}") for i in raw_labels_idx]
+
+    # Model/Predicted labels (X-axis): from plotting_morphology or derived from mapping
     plotting_morph = data_opts.get("plotting_morphology", {})
+    num_classes = cfg['model_options'].get('num_classes', 2)
     if plotting_morph:
-        # Sort by index to ensure correct order
         pred_labels = [plotting_morph[i] for i in sorted(plotting_morph.keys())]
+    elif morph_map:
+        # Derive class names from morphology_mapping
+        # Group raw morphology names by their mapped class index
+        class_to_raw = {}
+        for raw_idx, class_idx in sorted(morph_map.items()):
+            ci = int(class_idx)
+            if ci < 0:
+                continue  # skip ignored classes
+            name = RAW_MORPHOLOGY_NAMES.get(int(raw_idx), f"Morph {raw_idx}")
+            class_to_raw.setdefault(ci, []).append(name)
+        pred_labels = []
+        for ci in range(num_classes):
+            names = class_to_raw.get(ci, [f"Class {ci}"])
+            if len(names) == 1:
+                pred_labels.append(names[0])
+            else:
+                pred_labels.append("+".join(names))
     else:
-        # Fallback
-        num_classes = cfg['model_options'].get('num_classes', 2)
         pred_labels = [f"Class {i}" for i in range(num_classes)]
-        
+
     print(f"True Morphology Labels (Y-axis): {raw_labels}")
     print(f"Predicted Labels (X-axis): {pred_labels}")
 
     # 3. Load DataModule
-    # Inject limit_per_file if requested
-    if args.n_events > 0:
-        print(f"Limiting to {args.n_events} events per file.")
-        if "data_options" not in cfg:
-            cfg["data_options"] = {}
-        cfg["data_options"]["limit_per_file"] = args.n_events
+    data_format = cfg.get('data_format', 'parquet')
+    print(f"Data format: {data_format}")
 
-    dm = ParquetDataModule(cfg)
+    if data_format == 'mmap':
+        # Parse morphology_mapping for mmap
+        morph_map_opts = data_opts.get('morphology_mapping', None)
+        morphology_mapping = None
+        if morph_map_opts:
+            morphology_mapping = {int(k): float(v) for k, v in morph_map_opts.items()}
+            print(f"Morphology mapping: {morphology_mapping}")
+
+        mmap_paths = data_opts.get('mmap_paths', [])
+        training_opts = cfg.get('training_options', {})
+        dm = MmapDataModule(
+            mmap_paths=mmap_paths,
+            batch_size=training_opts.get('batch_size', 512),
+            num_workers=training_opts.get('num_workers', 8),
+            val_split=data_opts.get('val_split', 0.1),
+            split_seed=data_opts.get('seed', 42),
+            rescale=data_opts.get('rescale', True),
+            morphology_mapping=morphology_mapping,
+        )
+    else:
+        # Inject limit_per_file if requested
+        if args.n_events > 0:
+            print(f"Limiting to {args.n_events} events per file.")
+            if "data_options" not in cfg:
+                cfg["data_options"] = {}
+            cfg["data_options"]["limit_per_file"] = args.n_events
+        dm = ParquetDataModule(cfg)
+
     print("Setting up DataModule...")
     dm.setup(stage="fit")
     val_loader = dm.val_dataloader()
@@ -732,34 +777,47 @@ def main():
     task = cfg['model_options'].get('downstream_task')
 
     if task == 'morphology_classification':
-        # Existing morphology evaluation logic
+        # Morphology evaluation (supports binary and multiclass, handles -1 labels)
         all_logits = all_preds.numpy()
         all_mapped_targets = all_labels[:, 4].long().numpy()
         all_raw_indices = all_labels[:, 5].long().numpy() if all_labels.shape[1] > 5 else np.full_like(all_mapped_targets, -1)
 
+        # Filter out -1 labels (ignored classes, e.g. 2TnC with no data)
+        valid_mask = all_mapped_targets >= 0
+        n_filtered = (~valid_mask).sum()
+        if n_filtered > 0:
+            print(f"Filtering {n_filtered} events with mapped label=-1")
+            all_logits = all_logits[valid_mask]
+            all_mapped_targets = all_mapped_targets[valid_mask]
+            all_raw_indices = all_raw_indices[valid_mask]
+
         pred_classes = np.argmax(all_logits, axis=1)
-        
+
+        # Overall accuracy
+        overall_acc = (pred_classes == all_mapped_targets).mean()
+        print(f"\nOverall Accuracy: {overall_acc:.4f} ({overall_acc*100:.1f}%)")
+
         n_raw = len(raw_labels)
         n_pred = len(pred_labels)
-        
+
+        # Raw morphology confusion matrix (raw_labels x pred_labels)
         cm = np.zeros((n_raw, n_pred), dtype=int)
-        
         for t, p in zip(all_raw_indices, pred_classes):
             if t >= 0 and t < n_raw and p >= 0 and p < n_pred:
                 cm[t, p] += 1
-                
-        print("\n--- Confusion Matrix (Counts) ---")
+
+        print("\n--- Confusion Matrix (Raw Morphology, Counts) ---")
         print(cm)
-        
+
         row_sums = cm.sum(axis=1)
         valid_rows = row_sums > 0
         cm_filtered = cm[valid_rows]
         raw_labels_filtered = [label for i, label in enumerate(raw_labels) if valid_rows[i]]
         row_sums_filtered = row_sums[valid_rows]
-        
+
         if len(cm_filtered) > 0:
             cm_pct = (cm_filtered.astype('float') / row_sums_filtered[:, np.newaxis]) * 100
-            print("\n--- Confusion Matrix (Percentage) ---")
+            print("\n--- Confusion Matrix (Raw Morphology, Percentage) ---")
             print(cm_pct)
             plot_confusion_matrix(
                 cm_pct,
@@ -767,13 +825,48 @@ def main():
                 y_labels=raw_labels_filtered,
                 output_path=os.path.join(args.output_dir, "confusion_matrix.png")
             )
-        
-        y_true_one_hot = np.eye(len(pred_labels))[all_mapped_targets]
-        probs = torch.softmax(all_preds, dim=1).numpy()
+
+        # Mapped-class confusion matrix (pred_labels x pred_labels)
+        cm_mapped = np.zeros((n_pred, n_pred), dtype=int)
+        for t, p in zip(all_mapped_targets, pred_classes):
+            if 0 <= t < n_pred and 0 <= p < n_pred:
+                cm_mapped[t, p] += 1
+
+        row_sums_mapped = cm_mapped.sum(axis=1)
+        valid_mapped = row_sums_mapped > 0
+        if valid_mapped.any():
+            cm_mapped_pct = np.zeros_like(cm_mapped, dtype=float)
+            for i in range(n_pred):
+                if row_sums_mapped[i] > 0:
+                    cm_mapped_pct[i] = cm_mapped[i].astype(float) / row_sums_mapped[i] * 100
+            print("\n--- Confusion Matrix (Mapped Classes, Percentage) ---")
+            print(cm_mapped_pct)
+            mapped_labels_filtered = [pred_labels[i] for i in range(n_pred) if valid_mapped[i]]
+            plot_confusion_matrix(
+                cm_mapped_pct[valid_mapped][:, :],
+                x_labels=pred_labels,
+                y_labels=mapped_labels_filtered,
+                output_path=os.path.join(args.output_dir, "confusion_matrix_mapped.png")
+            )
+
+        # Per-class accuracy
+        print("\n--- Per-Class Accuracy ---")
+        for c in range(n_pred):
+            mask = all_mapped_targets == c
+            if mask.sum() > 0:
+                acc = (pred_classes[mask] == c).mean()
+                print(f"  {pred_labels[c]:>15s}: {acc:.4f} ({acc*100:.1f}%)  [N={mask.sum()}]")
+
+        # ROC curves
+        valid_for_roc = (all_mapped_targets >= 0) & (all_mapped_targets < n_pred)
+        targets_roc = all_mapped_targets[valid_for_roc]
+        logits_roc = all_logits[valid_for_roc]
+        y_true_one_hot = np.eye(n_pred)[targets_roc]
+        probs = torch.softmax(torch.from_numpy(logits_roc), dim=1).numpy()
         plot_roc_curve(
             y_true_one_hot,
             probs,
-            len(pred_labels),
+            n_pred,
             pred_labels,
             os.path.join(args.output_dir, "roc_curve.png")
         )
